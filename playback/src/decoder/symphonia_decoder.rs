@@ -239,6 +239,7 @@ impl AudioDecoder for SymphoniaDecoder {
             let packet_position = AudioPacketPosition {
                 position_ms,
                 skipped,
+                ..Default::default()
             };
 
             match self.decoder.decode(&packet) {

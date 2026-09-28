@@ -25,10 +25,11 @@ use crate::{
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
     core::{Error, Session, SpotifyId, SpotifyUri, audio_key::AudioKeyError, util::SeqGenerator},
-    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, SymphoniaDecoder},
+    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, NarratedDecoder, SymphoniaDecoder},
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
+    narration::{NarrationClip, TrackNarration},
 };
 use futures_util::{
     StreamExt, TryFutureExt, future, future::FusedFuture,
@@ -38,11 +39,37 @@ use librespot_metadata::{audio::UniqueFields, track::Tracks};
 
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
 
 use crate::SAMPLES_PER_SECOND;
 
 const PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS: u32 = 30000;
+
+/// A sanity bound on one narration clip, checked once the body is in hand. A clip runs a couple
+/// of seconds and weighs a few hundred kilobytes; anything far larger is not a narration clip.
+const MAX_NARRATION_SIZE: usize = 8 << 20;
+
+/// Bounds the synthesis round trip plus the download. Narration is a nicety; the track must not
+/// be held up for it indefinitely.
+const NARRATION_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How much louder a narration clip has to be played to sit at the same level as the track it
+/// belongs to.
+///
+/// Both sides state their gain against the same target, so their difference is the offset, and it
+/// holds whether or not the listener has normalisation switched on. Under album normalisation the
+/// clip lands off by the album's own offset from the track, which is a fraction of a dB in
+/// practice.
+fn narration_gain(clip: &NarrationClip, track: NormalisationData) -> f64 {
+    let gain = db_to_ratio(clip.normalisation_data().track_gain_db - track.track_gain_db);
+
+    // The track's levels are four raw floats out of a CDN-supplied header. A non-finite gain here
+    // would reach the dynamic limiter, whose state is never reset, and silence the whole session.
+    if gain.is_finite() { gain } else { 1.0 }
+}
 pub const DB_VOLTAGE_RATIO: f64 = 20.0;
 pub const PCM_AT_0DBFS: f64 = 1.0;
 
@@ -104,9 +131,11 @@ enum PlayerCommand {
         track_id: SpotifyUri,
         play: bool,
         position_ms: u32,
+        narration: Option<TrackNarration>,
     },
     Preload {
         track_id: SpotifyUri,
+        narration: Option<TrackNarration>,
     },
     Play,
     Pause,
@@ -550,15 +579,37 @@ impl Player {
     }
 
     pub fn load(&self, track_id: SpotifyUri, start_playing: bool, position_ms: u32) {
+        self.load_narrated(track_id, start_playing, position_ms, None)
+    }
+
+    /// Loads a track with the DJ's lines wrapped around it, as a DJ context asks for.
+    pub fn load_narrated(
+        &self,
+        track_id: SpotifyUri,
+        start_playing: bool,
+        position_ms: u32,
+        narration: Option<TrackNarration>,
+    ) {
         self.command(PlayerCommand::Load {
             track_id,
             play: start_playing,
             position_ms,
+            narration,
         });
     }
 
     pub fn preload(&self, track_id: SpotifyUri) {
-        self.command(PlayerCommand::Preload { track_id });
+        self.preload_narrated(track_id, None)
+    }
+
+    /// Preloads a track together with its narration. The player promotes preloaded data the
+    /// moment the previous track ends, so a bare preload would be heard for as long as the
+    /// synthesis takes before a load could replace it.
+    pub fn preload_narrated(&self, track_id: SpotifyUri, narration: Option<TrackNarration>) {
+        self.command(PlayerCommand::Preload {
+            track_id,
+            narration,
+        });
     }
 
     pub fn play(&self) {
@@ -989,8 +1040,9 @@ impl PlayerTrackLoader {
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
+        narration: Option<TrackNarration>,
     ) -> Result<PlayerLoadedTrackData, LoadError> {
-        match track_uri {
+        let mut loaded = match track_uri {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
                 self.load_remote_track(track_uri, position_ms).await
             }
@@ -1002,7 +1054,93 @@ impl PlayerTrackLoader {
                 error!("Cannot handle load of track with URI: <{track_uri}>",);
                 Err(LoadError::Unavailable)
             }
+        }?;
+
+        // Passthrough hands the sink raw container bytes; a synthesized clip is PCM, and
+        // splicing one into the other would corrupt the stream.
+        let narrating = self.config.dj_narration && !self.config.passthrough;
+
+        if let Some(narration) = narration.filter(|_| narrating) {
+            loaded = self.narrate(loaded, narration).await;
         }
+
+        Ok(loaded)
+    }
+
+    /// Wraps a loaded track in the DJ's lines. A clip that cannot be synthesized, fetched or
+    /// decoded is dropped with a warning: losing a spoken line is a much smaller problem than
+    /// losing the music.
+    async fn narrate(
+        &self,
+        mut loaded: PlayerLoadedTrackData,
+        narration: TrackNarration,
+    ) -> PlayerLoadedTrackData {
+        let load = async |clip: Option<NarrationClip>| {
+            let clip = clip?;
+
+            let decoder = match timeout(NARRATION_TIMEOUT, self.load_narration_clip(&clip)).await {
+                Ok(Ok(decoder)) => decoder,
+                Ok(Err(e)) => {
+                    warn!("Skipping DJ narration: {e}");
+                    return None;
+                }
+                Err(_) => {
+                    warn!("Skipping DJ narration: not ready within {NARRATION_TIMEOUT:?}");
+                    return None;
+                }
+            };
+
+            Some((decoder, narration_gain(&clip, loaded.normalisation_data)))
+        };
+
+        // Both at once: the track cannot start until they are in hand, and the closing line
+        // would otherwise add its whole round trip to that wait.
+        let (intro, outro) = future::join(load(narration.intro), load(narration.outro)).await;
+
+        if intro.is_none() && outro.is_none() {
+            return loaded;
+        }
+
+        let duration_ms = loaded.duration_ms;
+        loaded.decoder = Box::new(NarratedDecoder::new(
+            intro,
+            loaded.decoder,
+            outro,
+            duration_ms,
+        ));
+
+        loaded
+    }
+
+    async fn load_narration_clip(
+        &self,
+        clip: &NarrationClip,
+    ) -> Result<Box<dyn AudioDecoder + Send>, Error> {
+        let url = self
+            .session
+            .spclient()
+            .get_narration_url(&clip.tts_request())
+            .await?;
+
+        // The url is already signed, so `request_url` fetches it without the Authorization
+        // header the rest of the client sends.
+        let audio = self.session.spclient().request_url(&url).await?;
+
+        if audio.is_empty() {
+            return Err(Error::unavailable("narration audio is empty"));
+        } else if audio.len() > MAX_NARRATION_SIZE {
+            return Err(Error::out_of_range(format!(
+                "narration audio is larger than {MAX_NARRATION_SIZE} bytes"
+            )));
+        }
+
+        let length = audio.len() as u64;
+        let source = Subfile::new(io::Cursor::new(audio), 0, length)?;
+
+        let mut hint = Hint::new();
+        hint.mime_type("audio/mpeg");
+
+        Ok(Box::new(SymphoniaDecoder::new(source, hint)?))
     }
 
     async fn load_remote_track(
@@ -1488,7 +1626,12 @@ impl Future for PlayerInternal {
                     let track_id = track_id.clone();
                     match decoder.next_packet() {
                         Ok(result) => {
-                            if let Some((ref packet_position, ref packet)) = result {
+                            // A narration packet's position does not advance, so reporting it
+                            // would read as the stream falling a second further behind each second.
+                            let reportable =
+                                result.as_ref().filter(|(position, _)| !position.narration);
+
+                            if let Some((packet_position, packet)) = reportable {
                                 let new_stream_position_ms = packet_position.position_ms;
                                 let expected_position_ms = std::mem::replace(
                                     &mut *stream_position_ms,
@@ -2002,6 +2145,7 @@ impl PlayerInternal {
         play_request_id_option: Option<u64>,
         play: bool,
         position_ms: u32,
+        narration: Option<TrackNarration>,
     ) -> PlayerResult {
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
@@ -2142,6 +2286,12 @@ impl PlayerInternal {
         } = &self.preload
         {
             if track_id == *loaded_track_id {
+                // Whatever narration the preloaded data already carries is kept: rebuilding it
+                // would mean a second synthesis round trip for a track ready to play.
+                if narration.is_some() {
+                    debug!("Keeping the narration the preloaded track was built with");
+                }
+
                 let preload = std::mem::replace(&mut self.preload, PlayerPreload::None);
                 if let PlayerPreload::Ready {
                     track_id,
@@ -2193,8 +2343,8 @@ impl PlayerInternal {
         self.preload = PlayerPreload::None;
 
         // If we don't have a loader yet, create one from scratch.
-        let loader =
-            loader.unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms)));
+        let loader = loader
+            .unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms, narration)));
 
         // Set ourselves to a loading state.
         self.state = PlayerState::Loading {
@@ -2207,7 +2357,7 @@ impl PlayerInternal {
         Ok(())
     }
 
-    fn handle_command_preload(&mut self, track_id: SpotifyUri) {
+    fn handle_command_preload(&mut self, track_id: SpotifyUri, narration: Option<TrackNarration>) {
         debug!("Preloading track");
         let mut preload_track = true;
         // check whether the track is already loaded somewhere or being loaded.
@@ -2250,7 +2400,7 @@ impl PlayerInternal {
 
         // schedule the preload of the current track if desired.
         if preload_track {
-            let loader = self.load_track(track_id.clone(), 0);
+            let loader = self.load_track(track_id.clone(), 0, narration);
             self.preload = PlayerPreload::Loading {
                 track_id,
                 loader: Box::pin(loader),
@@ -2270,11 +2420,13 @@ impl PlayerInternal {
             ..
         } = self.state
         {
+            // A seek, so no narration: the DJ's lead-in belongs to a track starting from the top.
             return self.handle_command_load(
                 track_id.clone(),
                 Some(play_request_id),
                 start_playback,
                 position_ms,
+                None,
             );
         }
 
@@ -2331,9 +2483,13 @@ impl PlayerInternal {
                 track_id,
                 play,
                 position_ms,
-            } => self.handle_command_load(track_id, None, play, position_ms)?,
+                narration,
+            } => self.handle_command_load(track_id, None, play, position_ms, narration)?,
 
-            PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
+            PlayerCommand::Preload {
+                track_id,
+                narration,
+            } => self.handle_command_preload(track_id, narration),
 
             PlayerCommand::Seek(position_ms) => self.handle_command_seek(position_ms)?,
 
@@ -2442,6 +2598,7 @@ impl PlayerInternal {
         &mut self,
         spotify_uri: SpotifyUri,
         position_ms: u32,
+        narration: Option<TrackNarration>,
     ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, LoadError>> + Send + 'static {
         // This method creates a future that returns the loaded stream and associated info.
         // Ideally all work should be done using asynchronous code. However, seek() on the
@@ -2461,7 +2618,7 @@ impl PlayerInternal {
         let handle = tokio::runtime::Handle::current();
 
         let load_handle = thread::spawn(move || {
-            let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
+            let data = handle.block_on(loader.load_track(spotify_uri, position_ms, narration));
             let _ = result_tx.send(data);
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
@@ -2533,7 +2690,7 @@ impl fmt::Debug for PlayerCommand {
                 .field(&play)
                 .field(&position_ms)
                 .finish(),
-            PlayerCommand::Preload { track_id } => {
+            PlayerCommand::Preload { track_id, .. } => {
                 f.debug_tuple("Preload").field(&track_id).finish()
             }
             PlayerCommand::Play => f.debug_tuple("Play").finish(),

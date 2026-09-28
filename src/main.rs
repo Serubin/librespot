@@ -245,6 +245,7 @@ async fn get_setup() -> Setup {
     const DISABLE_AUDIO_CACHE: &str = "disable-audio-cache";
     const DISABLE_CREDENTIAL_CACHE: &str = "disable-credential-cache";
     const DISABLE_DISCOVERY: &str = "disable-discovery";
+    const DISABLE_DJ_NARRATION: &str = "disable-dj-narration";
     const DISABLE_GAPLESS: &str = "disable-gapless";
     const DITHER: &str = "dither";
     const EMIT_SINK_EVENTS: &str = "emit-sink-events";
@@ -421,6 +422,11 @@ async fn get_setup() -> Setup {
         DISABLE_GAPLESS_SHORT,
         DISABLE_GAPLESS,
         "Disable gapless playback.",
+    )
+    .optflag(
+        "",
+        DISABLE_DJ_NARRATION,
+        "Disable the spoken lines Spotify's DJ delivers around the tracks of a DJ context.",
     )
     .optflag(
         EMIT_SINK_EVENTS_SHORT,
@@ -1585,6 +1591,8 @@ async fn get_setup() -> Setup {
 
         let gapless = !opt_present(DISABLE_GAPLESS);
 
+        let dj_narration = !opt_present(DISABLE_DJ_NARRATION);
+
         let normalisation = opt_present(ENABLE_VOLUME_NORMALISATION);
 
         let (
@@ -1845,6 +1853,7 @@ async fn get_setup() -> Setup {
             ditherer,
             position_update_interval: None,
             local_file_directories,
+            dj_narration,
         }
     };
 

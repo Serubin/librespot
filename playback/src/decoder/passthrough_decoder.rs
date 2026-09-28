@@ -209,7 +209,7 @@ impl<R: Read + Seek> AudioDecoder for PassthroughDecoder<R> {
                 let position_ms = Self::position_pcm_to_ms(pckgp_page);
                 let packet_position = AudioPacketPosition {
                     position_ms,
-                    skipped: false,
+                    ..Default::default()
                 };
 
                 let ogg_data = AudioPacket::Raw(std::mem::take(data));

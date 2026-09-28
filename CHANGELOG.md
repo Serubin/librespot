@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [core] Add an in-memory credential cache for clients that persist grants in a protected store
 - [core] Add method `get_playlist_range` to `SpClient` for a window of a playlist's items with its header decorated on
 - [metadata] Add `Playlist::get_range` to fetch a window of a playlist's items without downloading the whole list
+- [playback] Play the spoken lines Spotify's DJ delivers around the tracks of a DJ context, via `Player::load_narrated` and `Player::preload_narrated`. Disable with `--disable-dj-narration`
+- [core] Add method `get_narration_url` to `SpClient`
+
+### Changed
+
+- [playback] `AudioPacketPosition` gained a `narration` field (breaking)
 
 ### Fixed
 
@@ -21,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [core, metadata, cli] Resolve Rust 1.98 Clippy warnings without changing behavior
 - [core] Include socket and proxy setup in the access-point connection timeout so retries can proceed
 - [playback] Stop instead of advancing through the queue when Spotify refuses an audio key
+- [connect] Resolve a DJ context through the `hm://` url it carries, so playing Spotify's DJ loads its tracks instead of failing with "the provided context has no tracks"
 
 ## [0.8.0] - 2025-11-10
 
