@@ -14,6 +14,7 @@ use crate::{
     model::{LoadRequest, PlayingTrack, SpircPlayStatus},
     playback::{
         mixer::Mixer,
+        narration::TrackNarration,
         player::{Player, PlayerEvent, PlayerEventChannel, QueueTrack},
     },
     protocol::{
@@ -94,6 +95,10 @@ struct SpircTask {
     player_events: Option<PlayerEventChannel>,
 
     context_resolver: ContextResolver,
+
+    /// records that the upcoming track is being reached by jumping straight to it, so a DJ
+    /// context introduces it with its jump line rather than the one for arriving in sequence
+    narration_jumped: bool,
 
     emit_set_queue_events: bool,
 
@@ -252,6 +257,7 @@ impl Spirc {
             player_events: Some(player_events),
 
             context_resolver: ContextResolver::new(session.clone()),
+            narration_jumped: false,
 
             emit_set_queue_events,
 
@@ -1692,8 +1698,11 @@ impl SpircTask {
             _ => (),
         }
 
-        if let Some(track_id) = self.connect_state.preview_next_track() {
-            self.player.preload(track_id);
+        if let Some((track_id, metadata)) = self.connect_state.preview_next_track() {
+            // Reaching a preloaded track always means arriving in turn, hence the intro rather
+            // than the jump line.
+            let narration = TrackNarration::from_metadata(&metadata, false);
+            self.player.preload_narrated(track_id, narration);
         }
     }
 
@@ -1742,6 +1751,10 @@ impl SpircTask {
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
         let continue_playing = self.connect_state.is_playing();
 
+        // Skipping straight to a chosen track is a jump, so a DJ context introduces it with its
+        // jump line rather than the one for arriving in sequence.
+        let jumped = track_uri.is_some();
+
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let mut has_next_track =
             matches!(track_uri, Some(ref track_uri) if current_uri == track_uri);
@@ -1761,6 +1774,7 @@ impl SpircTask {
 
         if has_next_track {
             self.add_autoplay_resolving_when_required();
+            self.narration_jumped = jumped;
             self.load_track(continue_playing, 0)
         } else {
             info!("Not playing next track because there are no more tracks left in queue.");
@@ -1904,7 +1918,18 @@ impl SpircTask {
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
-        self.player.load(id, start_playing, position_ms);
+
+        // Only from the top: resuming mid-track, or seeking, should not replay the lead-in.
+        let narration = (position_ms == 0)
+            .then(|| {
+                let metadata = self.connect_state.current_track(|t| t.metadata.clone());
+                TrackNarration::from_metadata(&metadata, self.narration_jumped)
+            })
+            .flatten();
+        self.narration_jumped = false;
+
+        self.player
+            .load_narrated(id, start_playing, position_ms, narration);
 
         self.connect_state
             .update_position(position_ms, self.now_ms());

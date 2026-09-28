@@ -7,6 +7,9 @@ mod passthrough_decoder;
 #[cfg(feature = "passthrough-decoder")]
 pub use passthrough_decoder::PassthroughDecoder;
 
+mod narrated_decoder;
+pub use narrated_decoder::NarratedDecoder;
+
 mod symphonia_decoder;
 pub use symphonia_decoder::SymphoniaDecoder;
 
@@ -61,10 +64,14 @@ impl AudioPacket {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AudioPacketPosition {
     pub position_ms: u32,
     pub skipped: bool,
+    /// Set while a DJ narration clip is playing rather than the track itself. Such a packet
+    /// carries the track's position, which does not advance, so the player must not read it as
+    /// the stream falling behind.
+    pub narration: bool,
 }
 
 impl Deref for AudioPacketPosition {

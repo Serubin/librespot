@@ -118,6 +118,9 @@ pub struct PlayerConfig {
 
     pub local_file_directories: Vec<PathBuf>,
 
+    /// Synthesize and play the spoken lines a DJ context attaches to its tracks.
+    pub dj_narration: bool,
+
     // pass function pointers so they can be lazily instantiated *after* spawning a thread
     // (thereby circumventing Send bounds that they might not satisfy)
     pub ditherer: Option<DithererBuilder>,
@@ -143,6 +146,7 @@ impl Default for PlayerConfig {
             ditherer: Some(mk_ditherer::<TriangularDitherer>),
             position_update_interval: None,
             local_file_directories: Vec::new(),
+            dj_narration: true,
         }
     }
 }
