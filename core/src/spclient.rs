@@ -70,6 +70,8 @@ pub enum SpClientError {
     NoData,
     #[error("expected an entry to exist in {0}")]
     ExpectedEntry(&'static str),
+    #[error("expected an hm:// url but got {0}")]
+    NotAnHmUrl(String),
 }
 
 impl From<SpClientError> for Error {
@@ -897,6 +899,29 @@ impl SpClient {
         let res = self
             .request_with_options(&Method::GET, &uri, None, None, &NO_METRICS_AND_SALT)
             .await?;
+
+        Self::parse_context(res)
+    }
+
+    /// Request the context from an `hm://` url the context itself provides, rather than from
+    /// `/context-resolve/v1`.
+    ///
+    /// Spotify's "DJ" contexts arrive without any tracks and name their real, session-scoped
+    /// track list this way, in `Context::url` or in the `lexicon_context_url` metadata key.
+    pub async fn get_context_from_url(&self, hm_url: &str) -> Result<Context, Error> {
+        let endpoint = hm_url
+            .strip_prefix("hm://")
+            .map(|path| format!("/{path}"))
+            .ok_or_else(|| SpClientError::NotAnHmUrl(hm_url.to_string()))?;
+
+        let res = self
+            .request_with_options(&Method::GET, &endpoint, None, None, &NO_METRICS_AND_SALT)
+            .await?;
+
+        Self::parse_context(res)
+    }
+
+    fn parse_context(res: Bytes) -> Result<Context, Error> {
         let ctx_json = String::from_utf8(res.to_vec())?;
         if ctx_json.is_empty() {
             Err(SpClientError::NoData)?
