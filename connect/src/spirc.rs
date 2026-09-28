@@ -1,6 +1,6 @@
 use crate::{
     LoadContextOptions, LoadRequestOptions, PlayContext,
-    context_resolver::{ContextAction, ContextResolver, ResolveContext},
+    context_resolver::{ContextAction, ContextResolver, ResolveContext, lexicon_url},
     core::{
         Error, Session, SpotifyUri,
         authentication::Credentials,
@@ -14,6 +14,7 @@ use crate::{
     model::{LoadRequest, PlayingTrack, SpircPlayStatus},
     playback::{
         mixer::Mixer,
+        narration::TrackNarration,
         player::{Player, PlayerEvent, PlayerEventChannel, QueueTrack},
     },
     protocol::{
@@ -94,6 +95,10 @@ struct SpircTask {
     player_events: Option<PlayerEventChannel>,
 
     context_resolver: ContextResolver,
+
+    /// records that the upcoming track is being reached by jumping straight to it, so a DJ
+    /// context introduces it with its jump line rather than the one for arriving in sequence
+    narration_jumped: bool,
 
     emit_set_queue_events: bool,
 
@@ -252,6 +257,7 @@ impl Spirc {
             player_events: Some(player_events),
 
             context_resolver: ContextResolver::new(session.clone()),
+            narration_jumped: false,
 
             emit_set_queue_events,
 
@@ -757,7 +763,7 @@ impl SpircTask {
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
-            SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+            SpircCommand::Load(command) => self.handle_load(command, None, None, None).await?,
             SpircCommand::AddToQueue(uri) => self.handle_add_to_queue(uri).await,
             SpircCommand::ClearQueue => {
                 self.connect_state.clear_queue()?;
@@ -1091,6 +1097,8 @@ impl SpircTask {
                     self.handle_activate()
                 }
 
+                let resolve_url = lexicon_url(&play.context).map(str::to_string);
+
                 let context = match play.context.uri {
                     Some(s) => PlayContext::Uri(s),
                     None if !play.context.pages.is_empty() => PlayContext::Tracks(
@@ -1130,6 +1138,7 @@ impl SpircTask {
                     },
                     play.context.pages.pop(),
                     fallback_index,
+                    resolve_url,
                 )
                 .await?;
 
@@ -1213,9 +1222,10 @@ impl SpircTask {
 
         match ctx_uri {
             Some(ref uri) => {
-                self.context_resolver.add(ResolveContext::from_uri(
+                self.context_resolver.add(ResolveContext::from_uri_with_url(
                     uri.clone(),
                     &fallback,
+                    lexicon_url(&transfer.current_session.context).map(str::to_string),
                     ContextType::Default,
                     ContextAction::Replace,
                 ));
@@ -1362,6 +1372,7 @@ impl SpircTask {
         cmd: LoadRequest,
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
+        resolve_url: Option<String>,
     ) -> Result<(), Error> {
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
@@ -1375,7 +1386,7 @@ impl SpircTask {
         let autoplay = matches!(cmd.context_options, Some(LoadContextOptions::Autoplay));
         match cmd.context {
             PlayContext::Uri(uri) => {
-                self.load_context_from_uri(uri, page.as_ref(), autoplay)
+                self.load_context_from_uri(uri, page.as_ref(), autoplay, resolve_url)
                     .await?
             }
             PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
@@ -1466,6 +1477,7 @@ impl SpircTask {
         context_uri: String,
         page: Option<&ContextPage>,
         autoplay: bool,
+        resolve_url: Option<String>,
     ) -> Result<(), Error> {
         if !self.connect_state.is_active() {
             self.handle_activate();
@@ -1491,14 +1503,17 @@ impl SpircTask {
 
         let current_context_uri = self.connect_state.context_uri();
 
-        if current_context_uri == &context_uri && fallback == context_uri {
+        // A DJ context keeps its uri from session to session but resolves to different tracks
+        // each time, so it has to be resolved even when the uri is unchanged.
+        if current_context_uri == &context_uri && fallback == context_uri && resolve_url.is_none() {
             debug!("context <{current_context_uri}> didn't change, no resolving required")
         } else {
             debug!("resolving context for load command");
             self.context_resolver.clear();
-            self.context_resolver.add(ResolveContext::from_uri(
+            self.context_resolver.add(ResolveContext::from_uri_with_url(
                 &context_uri,
                 fallback,
+                resolve_url,
                 update_context,
                 ContextAction::Replace,
             ));
@@ -1683,8 +1698,11 @@ impl SpircTask {
             _ => (),
         }
 
-        if let Some(track_id) = self.connect_state.preview_next_track() {
-            self.player.preload(track_id);
+        if let Some((track_id, metadata)) = self.connect_state.preview_next_track() {
+            // Reaching a preloaded track always means arriving in turn, hence the intro rather
+            // than the jump line.
+            let narration = TrackNarration::from_metadata(&metadata, false);
+            self.player.preload_narrated(track_id, narration);
         }
     }
 
@@ -1733,6 +1751,10 @@ impl SpircTask {
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
         let continue_playing = self.connect_state.is_playing();
 
+        // Skipping straight to a chosen track is a jump, so a DJ context introduces it with its
+        // jump line rather than the one for arriving in sequence.
+        let jumped = track_uri.is_some();
+
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let mut has_next_track =
             matches!(track_uri, Some(ref track_uri) if current_uri == track_uri);
@@ -1752,6 +1774,7 @@ impl SpircTask {
 
         if has_next_track {
             self.add_autoplay_resolving_when_required();
+            self.narration_jumped = jumped;
             self.load_track(continue_playing, 0)
         } else {
             info!("Not playing next track because there are no more tracks left in queue.");
@@ -1895,7 +1918,18 @@ impl SpircTask {
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
-        self.player.load(id, start_playing, position_ms);
+
+        // Only from the top: resuming mid-track, or seeking, should not replay the lead-in.
+        let narration = (position_ms == 0)
+            .then(|| {
+                let metadata = self.connect_state.current_track(|t| t.metadata.clone());
+                TrackNarration::from_metadata(&metadata, self.narration_jumped)
+            })
+            .flatten();
+        self.narration_jumped = false;
+
+        self.player
+            .load_narrated(id, start_playing, position_ms, narration);
 
         self.connect_state
             .update_position(position_ms, self.now_ms());

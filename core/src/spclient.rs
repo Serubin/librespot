@@ -12,6 +12,7 @@ use crate::{
     error::ErrorKind,
     protocol::{
         autoplay_context_request::AutoplayContextRequest,
+        client_tts::{TtsRequest, TtsResponse},
         clienttoken_http::{
             ChallengeAnswer, ChallengeType, ClientTokenRequest, ClientTokenRequestType,
             ClientTokenResponse, ClientTokenResponseType,
@@ -30,9 +31,10 @@ use bytes::Bytes;
 use data_encoding::HEXUPPER_PERMISSIVE;
 use futures_util::future::IntoStream;
 use http::{Uri, header::HeaderValue};
+use http_body_util::BodyExt;
 use hyper::{
     HeaderMap, Method, Request,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, RANGE},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, LOCATION, RANGE},
 };
 use hyper_util::client::legacy::ResponseFuture;
 use protobuf::{Enum, EnumOrUnknown, Message, MessageFull};
@@ -56,6 +58,8 @@ pub const CLIENT_TOKEN: HeaderName = HeaderName::from_static("client-token");
 #[allow(clippy::declare_interior_mutable_const)]
 const CONNECTION_ID: HeaderName = HeaderName::from_static("x-spotify-connection-id");
 
+const PROTOBUF_MIME: &str = "application/x-protobuf";
+
 const NO_METRICS_AND_SALT: RequestOptions = RequestOptions {
     metrics: false,
     salt: false,
@@ -70,6 +74,10 @@ pub enum SpClientError {
     NoData,
     #[error("expected an entry to exist in {0}")]
     ExpectedEntry(&'static str),
+    #[error("expected an hm:// url but got {0}")]
+    NotAnHmUrl(String),
+    #[error("expected an https:// url but got {0}")]
+    NotAnHttpsUrl(String),
 }
 
 impl From<SpClientError> for Error {
@@ -882,6 +890,29 @@ impl SpClient {
         let res = self
             .request_with_options(&Method::GET, &uri, None, None, &NO_METRICS_AND_SALT)
             .await?;
+
+        Self::parse_context(res)
+    }
+
+    /// Request the context from an `hm://` url the context itself provides, rather than from
+    /// `/context-resolve/v1`.
+    ///
+    /// Spotify's "DJ" contexts arrive without any tracks and name their real, session-scoped
+    /// track list this way, in `Context::url` or in the `lexicon_context_url` metadata key.
+    pub async fn get_context_from_url(&self, hm_url: &str) -> Result<Context, Error> {
+        let endpoint = hm_url
+            .strip_prefix("hm://")
+            .map(|path| format!("/{path}"))
+            .ok_or_else(|| SpClientError::NotAnHmUrl(hm_url.to_string()))?;
+
+        let res = self
+            .request_with_options(&Method::GET, &endpoint, None, None, &NO_METRICS_AND_SALT)
+            .await?;
+
+        Self::parse_context(res)
+    }
+
+    fn parse_context(res: Bytes) -> Result<Context, Error> {
         let ctx_json = String::from_utf8(res.to_vec())?;
         if ctx_json.is_empty() {
             Err(SpClientError::NoData)?
@@ -956,5 +987,77 @@ impl SpClient {
             &NO_METRICS_AND_SALT,
         )
         .await
+    }
+
+    /// Synthesize a narration script and return the url of the resulting audio.
+    ///
+    /// The endpoint answers a redirect with the url in `Location`, so this cannot go through
+    /// [`Self::request_with_options`], which only ever yields a body and treats a non-2xx status
+    /// as an error. A `TtsResponse` body is accepted too, since the schema documents one.
+    pub async fn get_narration_url(&self, tts_request: &TtsRequest) -> Result<String, Error> {
+        let body = tts_request.write_to_bytes()?;
+
+        let mut url = self.base_url().await?;
+        url.push_str("/client-tts/v1/fulfill");
+
+        let mut request = Request::builder()
+            .method(&Method::POST)
+            .uri(url)
+            .header(CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_MIME))
+            .header(ACCEPT, HeaderValue::from_static(PROTOBUF_MIME))
+            .header(CONTENT_LENGTH, body.len())
+            .body(Bytes::from(body))?;
+
+        let token = self.session().login5().auth_token().await?;
+
+        let headers = request.headers_mut();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("{} {}", token.token_type, token.access_token))?,
+        );
+
+        match self.client_token().await {
+            Ok(client_token) => {
+                headers.insert(CLIENT_TOKEN, HeaderValue::from_str(&client_token)?);
+            }
+            Err(e) => warn!("Unable to get client token: {e} Trying to continue without..."),
+        }
+
+        let response = self
+            .session()
+            .http_client()
+            .request_fut(request)?
+            .await
+            .map_err(Error::unavailable)?;
+
+        let status = response.status();
+
+        let url = if status.is_redirection() {
+            response
+                .headers()
+                .get(LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .map(str::to_string)
+                .ok_or(SpClientError::ExpectedEntry("client tts Location header"))?
+        } else if status.is_success() {
+            let body = response.into_body().collect().await?.to_bytes();
+            TtsResponse::parse_from_bytes(&body)?.url
+        } else if status.is_client_error() {
+            return Err(Error::failed_precondition(format!(
+                "client tts rejected the request: {status}"
+            )));
+        } else {
+            return Err(Error::unavailable(format!(
+                "invalid status code from client tts: {status}"
+            )));
+        };
+
+        // The url is followed unauthenticated, so refuse to be pointed at a plaintext or
+        // non-http host.
+        if !url.starts_with("https://") {
+            return Err(SpClientError::NotAnHttpsUrl(url).into());
+        }
+
+        Ok(url)
     }
 }
