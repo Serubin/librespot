@@ -43,25 +43,31 @@ pub enum ResetContext<'s> {
     WhenDifferent(&'s str),
 }
 
+/// Where the tracks of a context page that arrived empty can be fetched from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PageRef {
+    /// A spotify uri, resolved through `/context-resolve/v1`.
+    Uri(String),
+    /// An `hm://` url, resolved as-is.
+    Url(String),
+}
+
 /// Extracts the spotify uri from a given page_url
 ///
 /// Just extracts "spotify/album/5LFzwirfFwBKXJQGfwmiMY" and replaces the slash's with colon's
 ///
 /// Expected `page_url` should look something like the following:
 /// `hm://artistplaycontext/v1/page/spotify/album/5LFzwirfFwBKXJQGfwmiMY/km_artist`
-fn page_url_to_uri(page_url: &str) -> String {
-    let split = if let Some(rest) = page_url.strip_prefix("hm://") {
-        rest.split('/')
-    } else {
-        warn!("page_url didn't start with hm://. got page_url: {page_url}");
-        page_url.split('/')
-    };
+fn page_url_to_uri(page_url: &str) -> Option<String> {
+    let rest = page_url.strip_prefix("hm://")?;
 
-    split
+    let segments = rest
+        .split('/')
         .skip_while(|s| s != &"spotify")
         .take(3)
-        .collect::<Vec<&str>>()
-        .join(":")
+        .collect::<Vec<&str>>();
+
+    (segments.len() == 3).then(|| segments.join(":"))
 }
 
 impl ConnectState {
@@ -189,7 +195,7 @@ impl ConnectState {
         &mut self,
         mut context: Context,
         ty: ContextType,
-    ) -> Result<Option<Vec<String>>, Error> {
+    ) -> Result<Option<Vec<PageRef>>, Error> {
         if context.pages.iter().all(|p| p.tracks.is_empty()) {
             error!("context didn't have any tracks: {context:#?}");
             Err(StateError::ContextHasNoTracks)?;
@@ -283,10 +289,14 @@ impl ConnectState {
                 if !page.tracks.is_empty() {
                     self.fill_context_from_page(page).ok()?;
                     None
-                } else if matches!(page.page_url, Some(ref url) if !url.is_empty()) {
-                    Some(page_url_to_uri(
-                        &page.page_url.expect("checked by precondition"),
-                    ))
+                } else if matches!(page.page_url, Some(ref url) if url.starts_with("hm://")) {
+                    let url = page.page_url.expect("checked by precondition");
+                    // A page url usually names a uri to resolve; a DJ context's does not, and is
+                    // fetched as it stands instead.
+                    Some(match page_url_to_uri(&url) {
+                        Some(uri) => PageRef::Uri(uri),
+                        None => PageRef::Url(url),
+                    })
                 } else {
                     warn!("unhandled context page: {page:#?}");
                     None
@@ -516,5 +526,47 @@ impl ConnectState {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_url_to_uri;
+
+    #[test]
+    fn page_url_to_uri_extracts_an_artist_page() {
+        assert_eq!(
+            page_url_to_uri(
+                "hm://artistplaycontext/v1/page/spotify/album/5LFzwirfFwBKXJQGfwmiMY/km_artist"
+            )
+            .as_deref(),
+            Some("spotify:album:5LFzwirfFwBKXJQGfwmiMY")
+        );
+    }
+
+    #[test]
+    fn page_url_to_uri_rejects_a_url_naming_no_uri() {
+        assert_eq!(
+            page_url_to_uri(
+                "hm://lexicon-session-provider/context-resolve/v2/session?contextUri=spotify:playlist:x"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn page_url_to_uri_rejects_a_truncated_uri() {
+        assert_eq!(
+            page_url_to_uri("hm://artistplaycontext/v1/page/spotify"),
+            None
+        );
+    }
+
+    #[test]
+    fn page_url_to_uri_rejects_a_non_hm_url() {
+        assert_eq!(
+            page_url_to_uri("https://example.test/spotify/album/x"),
+            None
+        );
     }
 }

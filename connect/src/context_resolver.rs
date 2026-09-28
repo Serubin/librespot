@@ -4,7 +4,10 @@ use crate::{
         autoplay_context_request::AutoplayContextRequest, context::Context,
         transfer_state::TransferState,
     },
-    state::{ConnectState, context::ContextType},
+    state::{
+        ConnectState,
+        context::{ContextType, PageRef},
+    },
 };
 use std::{
     cmp::PartialEq,
@@ -16,10 +19,28 @@ use std::{
 use thiserror::Error as ThisError;
 use tokio::time::Instant;
 
+/// Metadata key under which a DJ context names the url its tracks come from.
+const LEXICON_CONTEXT_URL: &str = "lexicon_context_url";
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum Resolve {
     Uri(String),
     Context(Context),
+}
+
+/// The `hm://` url a context names for resolving its own tracks, if it has one.
+///
+/// A DJ context arrives with no tracks at all; its real, session-scoped track list lives behind
+/// this url rather than behind `/context-resolve/v1/<uri>`.
+pub(super) fn lexicon_url(context: &Context) -> Option<&str> {
+    let is_hm = |url: &&String| url.starts_with("hm://");
+
+    context
+        .url
+        .as_ref()
+        .filter(is_hm)
+        .or_else(|| context.metadata.get(LEXICON_CONTEXT_URL).filter(is_hm))
+        .map(String::as_str)
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -31,15 +52,24 @@ pub(super) enum ContextAction {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(super) struct ResolveContext {
     resolve: Resolve,
+    /// the `hm://` url to fetch instead of resolving [`Self::resolve_uri`], when the context or
+    /// page names one
+    resolve_url: Option<String>,
     fallback: Option<String>,
     update: ContextType,
     action: ContextAction,
 }
 
 impl ResolveContext {
-    fn append_context(uri: impl Into<String>) -> Self {
+    fn append_context(context_uri: &str, page: PageRef) -> Self {
+        let (uri, resolve_url) = match page {
+            PageRef::Uri(uri) => (uri, None),
+            PageRef::Url(url) => (context_uri.to_string(), Some(url)),
+        };
+
         Self {
-            resolve: Resolve::Uri(uri.into()),
+            resolve: Resolve::Uri(uri),
+            resolve_url,
             fallback: None,
             update: ContextType::Default,
             action: ContextAction::Append,
@@ -55,14 +85,29 @@ impl ResolveContext {
         let fallback_uri = fallback.into();
         Self {
             resolve: Resolve::Uri(uri.into()),
+            resolve_url: None,
             fallback: (!fallback_uri.is_empty()).then_some(fallback_uri),
             update,
             action,
         }
     }
 
+    pub fn from_uri_with_url(
+        uri: impl Into<String>,
+        fallback: impl Into<String>,
+        resolve_url: Option<String>,
+        update: ContextType,
+        action: ContextAction,
+    ) -> Self {
+        Self {
+            resolve_url,
+            ..Self::from_uri(uri, fallback, update, action)
+        }
+    }
+
     pub fn from_context(context: Context, update: ContextType, action: ContextAction) -> Self {
         Self {
+            resolve_url: lexicon_url(&context).map(str::to_string),
             resolve: Resolve::Context(context),
             fallback: None,
             update,
@@ -96,8 +141,9 @@ impl Display for ResolveContext {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "resolve_uri: <{:?}>, context_uri: <{}>, update: <{:?}>",
+            "resolve_uri: <{:?}>, resolve_url: <{:?}>, context_uri: <{}>, update: <{:?}>",
             self.resolve_uri(),
+            self.resolve_url,
             self.context_uri(),
             self.update,
         )
@@ -213,15 +259,32 @@ impl ContextResolver {
         let (next, resolve_uri, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
         match next.update {
-            ContextType::Default => {
-                let mut ctx = self.session.spclient().get_context(resolve_uri).await;
-                if let Ok(ctx) = ctx.as_mut() {
-                    ctx.uri = Some(next.context_uri().to_string());
-                    ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
-                }
+            ContextType::Default => match next.resolve_url {
+                Some(ref url) => {
+                    let mut ctx = self.session.spclient().get_context_from_url(url).await;
+                    if let Ok(ctx) = ctx.as_mut() {
+                        ctx.uri = Some(next.context_uri().to_string());
+                        // `url` and the requesting metadata are kept, not overwritten with
+                        // `context://<uri>`: they are how a re-resolve finds the tracks again.
+                        if let Resolve::Context(ref requested) = next.resolve {
+                            for (key, value) in &requested.metadata {
+                                ctx.metadata.insert(key.clone(), value.clone());
+                            }
+                        }
+                    }
 
-                ctx
-            }
+                    ctx
+                }
+                None => {
+                    let mut ctx = self.session.spclient().get_context(resolve_uri).await;
+                    if let Ok(ctx) = ctx.as_mut() {
+                        ctx.uri = Some(next.context_uri().to_string());
+                        ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
+                    }
+
+                    ctx
+                }
+            },
             ContextType::Autoplay => {
                 if resolve_uri.contains("spotify:show:") || resolve_uri.contains("spotify:episode:")
                 {
@@ -273,10 +336,12 @@ impl ContextResolver {
             }
         }?;
 
+        let context_uri = state.context_uri().clone();
+
         Ok(remaining.map(|remaining| {
             remaining
                 .into_iter()
-                .map(ResolveContext::append_context)
+                .map(|page| ResolveContext::append_context(&context_uri, page))
                 .collect::<Vec<_>>()
         }))
     }
@@ -342,5 +407,80 @@ impl ContextResolver {
         state.update_queue_revision();
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HM_URL: &str = "hm://lexicon-session-provider/context-resolve/v2/session?contextUri=spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
+    const DJ_URI: &str = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
+
+    fn context(url: Option<&str>, lexicon: Option<&str>) -> Context {
+        let mut context = Context {
+            uri: Some(DJ_URI.into()),
+            url: url.map(str::to_string),
+            ..Default::default()
+        };
+
+        if let Some(lexicon) = lexicon {
+            context
+                .metadata
+                .insert(LEXICON_CONTEXT_URL.into(), lexicon.into());
+        }
+
+        context
+    }
+
+    #[test]
+    fn lexicon_url_prefers_the_context_url() {
+        assert_eq!(
+            lexicon_url(&context(Some(HM_URL), Some("hm://other"))),
+            Some(HM_URL)
+        );
+    }
+
+    #[test]
+    fn lexicon_url_falls_back_to_the_metadata() {
+        let ctx = context(Some("context://spotify:playlist:x"), Some(HM_URL));
+        assert_eq!(lexicon_url(&ctx), Some(HM_URL));
+    }
+
+    #[test]
+    fn lexicon_url_ignores_an_ordinary_context() {
+        let ctx = context(Some("context://spotify:playlist:x"), None);
+        assert_eq!(lexicon_url(&ctx), None);
+    }
+
+    #[test]
+    fn from_context_carries_the_lexicon_url() {
+        let resolve = ResolveContext::from_context(
+            context(None, Some(HM_URL)),
+            ContextType::Default,
+            ContextAction::Replace,
+        );
+
+        assert_eq!(resolve.resolve_url.as_deref(), Some(HM_URL));
+    }
+
+    #[test]
+    fn append_context_keeps_the_context_uri_for_a_page_url() {
+        let resolve = ResolveContext::append_context(DJ_URI, PageRef::Url(HM_URL.into()));
+
+        assert_eq!(resolve.context_uri(), DJ_URI);
+        assert_eq!(resolve.resolve_url.as_deref(), Some(HM_URL));
+    }
+
+    #[test]
+    fn append_context_resolves_a_page_uri_by_uri() {
+        let page_uri = "spotify:album:5LFzwirfFwBKXJQGfwmiMY";
+        let resolve = ResolveContext::append_context(
+            "spotify:artist:5LFzwirfFwBKXJQGfwmiMY",
+            PageRef::Uri(page_uri.into()),
+        );
+
+        assert_eq!(resolve.resolve_uri(), Some(page_uri));
+        assert_eq!(resolve.resolve_url, None);
     }
 }

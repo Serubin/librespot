@@ -1,6 +1,6 @@
 use crate::{
     LoadContextOptions, LoadRequestOptions, PlayContext,
-    context_resolver::{ContextAction, ContextResolver, ResolveContext},
+    context_resolver::{ContextAction, ContextResolver, ResolveContext, lexicon_url},
     core::{
         Error, Session, SpotifyUri,
         authentication::Credentials,
@@ -757,7 +757,7 @@ impl SpircTask {
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
-            SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+            SpircCommand::Load(command) => self.handle_load(command, None, None, None).await?,
             SpircCommand::AddToQueue(uri) => self.handle_add_to_queue(uri).await,
             SpircCommand::ClearQueue => {
                 self.connect_state.clear_queue()?;
@@ -1091,6 +1091,8 @@ impl SpircTask {
                     self.handle_activate()
                 }
 
+                let resolve_url = lexicon_url(&play.context).map(str::to_string);
+
                 let context = match play.context.uri {
                     Some(s) => PlayContext::Uri(s),
                     None if !play.context.pages.is_empty() => PlayContext::Tracks(
@@ -1130,6 +1132,7 @@ impl SpircTask {
                     },
                     play.context.pages.pop(),
                     fallback_index,
+                    resolve_url,
                 )
                 .await?;
 
@@ -1213,9 +1216,10 @@ impl SpircTask {
 
         match ctx_uri {
             Some(ref uri) => {
-                self.context_resolver.add(ResolveContext::from_uri(
+                self.context_resolver.add(ResolveContext::from_uri_with_url(
                     uri.clone(),
                     &fallback,
+                    lexicon_url(&transfer.current_session.context).map(str::to_string),
                     ContextType::Default,
                     ContextAction::Replace,
                 ));
@@ -1362,6 +1366,7 @@ impl SpircTask {
         cmd: LoadRequest,
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
+        resolve_url: Option<String>,
     ) -> Result<(), Error> {
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
@@ -1375,7 +1380,7 @@ impl SpircTask {
         let autoplay = matches!(cmd.context_options, Some(LoadContextOptions::Autoplay));
         match cmd.context {
             PlayContext::Uri(uri) => {
-                self.load_context_from_uri(uri, page.as_ref(), autoplay)
+                self.load_context_from_uri(uri, page.as_ref(), autoplay, resolve_url)
                     .await?
             }
             PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
@@ -1466,6 +1471,7 @@ impl SpircTask {
         context_uri: String,
         page: Option<&ContextPage>,
         autoplay: bool,
+        resolve_url: Option<String>,
     ) -> Result<(), Error> {
         if !self.connect_state.is_active() {
             self.handle_activate();
@@ -1491,14 +1497,17 @@ impl SpircTask {
 
         let current_context_uri = self.connect_state.context_uri();
 
-        if current_context_uri == &context_uri && fallback == context_uri {
+        // A DJ context keeps its uri from session to session but resolves to different tracks
+        // each time, so it has to be resolved even when the uri is unchanged.
+        if current_context_uri == &context_uri && fallback == context_uri && resolve_url.is_none() {
             debug!("context <{current_context_uri}> didn't change, no resolving required")
         } else {
             debug!("resolving context for load command");
             self.context_resolver.clear();
-            self.context_resolver.add(ResolveContext::from_uri(
+            self.context_resolver.add(ResolveContext::from_uri_with_url(
                 &context_uri,
                 fallback,
+                resolve_url,
                 update_context,
                 ContextAction::Replace,
             ));
