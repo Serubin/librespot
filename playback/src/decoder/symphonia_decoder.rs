@@ -18,6 +18,8 @@ pub struct SymphoniaDecoder {
     probe_result: ProbeResult,
     decoder: Box<dyn Decoder>,
     sample_buffer: Option<SampleBuffer<f64>>,
+    /// The source is mono and each sample is sent to both channels.
+    upmix_mono: bool,
 }
 
 #[derive(Default)]
@@ -33,6 +35,24 @@ pub(crate) struct LocalFileMetadata {
 
 impl SymphoniaDecoder {
     pub fn new<R>(input: R, hint: Hint) -> DecoderResult<Self>
+    where
+        R: MediaSource + 'static,
+    {
+        Self::open(input, hint, false)
+    }
+
+    /// Opens a source that may be mono, playing it over both channels.
+    ///
+    /// Spotify synthesizes the DJ's lines in mono, and the request for one names no channel
+    /// count to ask otherwise.
+    pub fn new_allowing_mono<R>(input: R, hint: Hint) -> DecoderResult<Self>
+    where
+        R: MediaSource + 'static,
+    {
+        Self::open(input, hint, true)
+    }
+
+    fn open<R>(input: R, hint: Hint, allow_mono: bool) -> DecoderResult<Self>
     where
         R: MediaSource + 'static,
     {
@@ -77,7 +97,8 @@ impl SymphoniaDecoder {
         let channels = decoder.codec_params().channels.ok_or_else(|| {
             DecoderError::SymphoniaDecoder("Could not retrieve channel configuration".into())
         })?;
-        if channels.count() != NUM_CHANNELS as usize {
+        let upmix_mono = allow_mono && channels.count() == 1;
+        if channels.count() != NUM_CHANNELS as usize && !upmix_mono {
             return Err(DecoderError::SymphoniaDecoder(format!(
                 "Unsupported number of channels: {channels}"
             )));
@@ -89,6 +110,7 @@ impl SymphoniaDecoder {
             // We set the sample buffer when decoding the first full packet,
             // whose duration is also the ideal sample buffer size.
             sample_buffer: None,
+            upmix_mono,
         })
     }
 
@@ -254,7 +276,16 @@ impl AudioDecoder for SymphoniaDecoder {
                     };
 
                     sample_buffer.copy_interleaved_ref(decoded);
-                    let samples = AudioPacket::Samples(sample_buffer.samples().to_vec());
+                    let samples = if self.upmix_mono {
+                        sample_buffer
+                            .samples()
+                            .iter()
+                            .flat_map(|sample| [*sample, *sample])
+                            .collect()
+                    } else {
+                        sample_buffer.samples().to_vec()
+                    };
+                    let samples = AudioPacket::Samples(samples);
 
                     return Ok(Some((packet_position, samples)));
                 }

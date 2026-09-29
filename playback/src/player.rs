@@ -1152,7 +1152,7 @@ impl PlayerTrackLoader {
         let mut hint = Hint::new();
         hint.mime_type("audio/mpeg");
 
-        Ok(Box::new(SymphoniaDecoder::new(source, hint)?))
+        Ok(Box::new(SymphoniaDecoder::new_allowing_mono(source, hint)?))
     }
 
     async fn load_remote_track(
