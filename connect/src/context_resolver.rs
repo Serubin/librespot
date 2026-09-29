@@ -286,6 +286,32 @@ impl ContextResolver {
                 }
                 None => {
                     let mut ctx = self.session.spclient().get_context(resolve_uri).await;
+
+                    // A DJ context resolves to no tracks at all, naming instead the url its
+                    // own session-scoped list lives behind.
+                    let lexicon = match ctx.as_ref() {
+                        Ok(context) if context.pages.iter().all(|page| page.tracks.is_empty()) => {
+                            lexicon_url(context).map(str::to_string)
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(url) = lexicon {
+                        let requested = ctx.map(|context| context.metadata).unwrap_or_default();
+                        let mut ctx = self.session.spclient().get_context_from_url(&url).await;
+                        if let Ok(ctx) = ctx.as_mut() {
+                            ctx.uri = Some(next.context_uri().to_string());
+                            // `url` and the naming metadata are kept, not overwritten with
+                            // `context://<uri>`: they are how a re-resolve finds the tracks
+                            // again.
+                            for (key, value) in requested {
+                                ctx.metadata.entry(key).or_insert(value);
+                            }
+                        }
+
+                        return ctx;
+                    }
+
                     if let Ok(ctx) = ctx.as_mut() {
                         ctx.uri = Some(next.context_uri().to_string());
                         ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
