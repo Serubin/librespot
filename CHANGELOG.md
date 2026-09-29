@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [metadata] Add `Playlist::get_range` to fetch a window of a playlist's items without downloading the whole list
 - [playback] Play the spoken lines Spotify's DJ delivers around the tracks of a DJ context, via `Player::load_narrated` and `Player::preload_narrated`. Disable with `--disable-dj-narration`
 - [core] Add method `get_narration_url` to `SpClient`
+- [playback] Add `PlayerEvent::NarrationChanged`, reporting when the DJ starts and stops speaking over a narrated track
 
 ### Changed
 

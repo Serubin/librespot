@@ -120,6 +120,7 @@ struct PlayerInternal {
     player_id: usize,
     play_request_id_generator: SeqGenerator<u64>,
     last_progress_update: Instant,
+    narrating: bool,
 
     local_file_lookup: Arc<LocalFileLookup>,
 }
@@ -282,6 +283,13 @@ pub enum PlayerEvent {
     FilterExplicitContentChanged {
         filter: bool,
     },
+    /// The DJ started or stopped speaking over a narrated track. No position is reported while it
+    /// speaks, so a client that extrapolates one must hold it still for the duration.
+    NarrationChanged {
+        play_request_id: u64,
+        track_id: SpotifyUri,
+        narrating: bool,
+    },
 }
 
 impl PlayerEvent {
@@ -316,6 +324,9 @@ impl PlayerEvent {
                 play_request_id, ..
             }
             | Seeked {
+                play_request_id, ..
+            }
+            | NarrationChanged {
                 play_request_id, ..
             } => Some(*play_request_id),
             _ => None,
@@ -545,6 +556,7 @@ impl Player {
                 player_id,
                 play_request_id_generator: SeqGenerator::new(0),
                 last_progress_update: Instant::now(),
+                narrating: false,
 
                 local_file_lookup: Arc::new(local_file_lookup),
             };
@@ -1613,6 +1625,8 @@ impl Future for PlayerInternal {
             if self.state.is_playing() {
                 self.ensure_sink_running();
 
+                let mut narration_change = None;
+
                 if let PlayerState::Playing {
                     ref track_id,
                     play_request_id,
@@ -1630,6 +1644,14 @@ impl Future for PlayerInternal {
                             // would read as the stream falling a second further behind each second.
                             let reportable =
                                 result.as_ref().filter(|(position, _)| !position.narration);
+
+                            narration_change = Some((
+                                result
+                                    .as_ref()
+                                    .is_some_and(|(position, _)| position.narration),
+                                play_request_id,
+                                track_id.clone(),
+                            ));
 
                             if let Some((packet_position, packet)) = reportable {
                                 let new_stream_position_ms = packet_position.position_ms;
@@ -1739,6 +1761,10 @@ impl Future for PlayerInternal {
                     error!("PlayerInternal poll: Invalid PlayerState");
                     exit(1);
                 };
+
+                if let Some((narrating, play_request_id, track_id)) = narration_change {
+                    self.set_narrating(narrating, play_request_id, &track_id);
+                }
             }
 
             if let PlayerState::Playing {
@@ -1832,6 +1858,21 @@ impl PlayerInternal {
         }
     }
 
+    /// Announces a change in whether the DJ is speaking, so clients can hold the position they
+    /// show and refuse a seek for as long as it lasts.
+    fn set_narrating(&mut self, narrating: bool, play_request_id: u64, track_id: &SpotifyUri) {
+        if self.narrating == narrating {
+            return;
+        }
+
+        self.narrating = narrating;
+        self.send_event(PlayerEvent::NarrationChanged {
+            play_request_id,
+            track_id: track_id.clone(),
+            narrating,
+        });
+    }
+
     fn handle_player_stop(&mut self) {
         match self.state {
             PlayerState::Playing {
@@ -1856,6 +1897,7 @@ impl PlayerInternal {
             } => {
                 let track_id = track_id.clone();
 
+                self.set_narrating(false, play_request_id, &track_id);
                 self.ensure_sink_stopped(false);
                 self.send_event(PlayerEvent::Stopped {
                     track_id,
