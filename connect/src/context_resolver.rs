@@ -251,6 +251,36 @@ impl ContextResolver {
     pub fn has_next(&self) -> bool {
         self.find_next().is_some()
     }
+    pub fn next_is_url_page(&self) -> bool {
+        self.find_next().is_some_and(|(next, _, _)| {
+            next.action == ContextAction::Append && next.resolve_url.is_some()
+        })
+    }
+
+    fn is_unavailable(&self, resolve: &ResolveContext) -> bool {
+        self.unavailable_contexts
+            .get(resolve)
+            .is_some_and(|tried| tried.elapsed() <= RETRY_UNAVAILABLE)
+    }
+
+    /// Queues the context's next page, if it has one. Returns whether it is queued.
+    pub fn add_next_page(&mut self, state: &ConnectState) -> bool {
+        let Some(url) = state.next_page_url() else {
+            return false;
+        };
+
+        let context_uri = state.context_uri();
+        let resolve = ResolveContext::append_context(context_uri, PageRef::Url(url.to_string()));
+        if resolve.resolve_uri().is_none() || self.is_unavailable(&resolve) {
+            return false;
+        } else if self.queue.contains(&resolve) {
+            return true;
+        }
+
+        debug!("requesting the next page of <{context_uri}>: {url}");
+        self.add(resolve);
+        true
+    }
 
     pub async fn get_next_context(
         &self,
@@ -277,6 +307,28 @@ impl ContextResolver {
                 }
                 None => {
                     let mut ctx = self.session.spclient().get_context(resolve_uri).await;
+
+                    // a DJ context resolved by its uri comes back without tracks
+                    let lexicon = match ctx.as_ref() {
+                        Ok(c) if c.pages.iter().all(|p| p.tracks.is_empty()) => {
+                            lexicon_url(c).map(|url| (url.to_string(), c.metadata.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((url, metadata)) = lexicon {
+                        debug!(
+                            "<{resolve_uri}> came back without tracks, resolving it through {url}"
+                        );
+                        let mut ctx = self.session.spclient().get_context_from_url(&url).await;
+                        if let Ok(ctx) = ctx.as_mut() {
+                            ctx.uri = Some(next.context_uri().to_string());
+                            for (key, value) in metadata {
+                                ctx.metadata.entry(key).or_insert(value);
+                            }
+                        }
+                        return ctx;
+                    }
+
                     if let Ok(ctx) = ctx.as_mut() {
                         ctx.uri = Some(next.context_uri().to_string());
                         ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
@@ -317,6 +369,14 @@ impl ContextResolver {
         mut context: Context,
     ) -> Result<Option<Vec<ResolveContext>>, Error> {
         let (next, _, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
+
+        // an autoplay page names the next radio page, not the context's
+        for page in &mut context.pages {
+            let own_url = page.next_page_url.is_some() && page.next_page_url == next.resolve_url;
+            if next.update == ContextType::Autoplay || own_url {
+                page.next_page_url = None;
+            }
+        }
 
         let remaining = match next.action {
             ContextAction::Append if context.pages.len() == 1 => state
@@ -413,6 +473,7 @@ impl ContextResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{context_page::ContextPage, context_track::ContextTrack};
 
     const HM_URL: &str = "hm://lexicon-session-provider/context-resolve/v2/session?contextUri=spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
     const DJ_URI: &str = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
@@ -482,5 +543,166 @@ mod tests {
 
         assert_eq!(resolve.resolve_uri(), Some(page_uri));
         assert_eq!(resolve.resolve_url, None);
+    }
+
+    const NEXT_URL: &str = "hm://lexicon-session-provider/context-resolve/v2/session/0?contextUri=spotify:playlist:37i9dQZF1EYkqdzj48dyYq&previousSegmentId=1";
+    const LATER_URL: &str = "hm://lexicon-session-provider/context-resolve/v2/session/0?contextUri=spotify:playlist:37i9dQZF1EYkqdzj48dyYq&previousSegmentId=2";
+    const RADIO_URL: &str =
+        "hm://radio-apollo/v3/tracks/spotify:playlist:37i9dQZF1EYkqdzj48dyYq?offset=3";
+    const INTRO: &str = "narration.intro.ssml";
+
+    fn uri(i: u32) -> String {
+        format!("spotify:track:{i:022}")
+    }
+
+    fn page(tracks: std::ops::Range<u32>, next_page_url: Option<&str>) -> ContextPage {
+        ContextPage {
+            tracks: tracks
+                .map(|i| ContextTrack {
+                    uri: Some(uri(i)),
+                    metadata: [(INTRO.to_string(), format!("<speak>{i}</speak>"))].into(),
+                    ..Default::default()
+                })
+                .collect(),
+            next_page_url: next_page_url.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn setup() -> (ContextResolver, ConnectState) {
+        let session = Session::new(Default::default(), None);
+        let state = ConnectState::new(Default::default(), &session);
+        (ContextResolver::new(session), state)
+    }
+    fn answer(resolver: &mut ContextResolver, state: &mut ConnectState, pages: Vec<ContextPage>) {
+        let context = Context {
+            uri: Some(DJ_URI.to_string()),
+            pages,
+            ..Default::default()
+        };
+        resolver.apply_next_context(state, context).unwrap();
+        resolver.try_finish(state, &mut None);
+        resolver.remove_used_and_invalid();
+    }
+    fn play_until_low(next_page_url: Option<&str>) -> (ContextResolver, ConnectState) {
+        let (mut resolver, mut state) = setup();
+        resolver.add(ResolveContext::from_uri(
+            DJ_URI,
+            "",
+            ContextType::Default,
+            ContextAction::Replace,
+        ));
+        answer(&mut resolver, &mut state, vec![page(0..3, next_page_url)]);
+        while state.has_next_tracks(Some(2)) {
+            state.next_track().unwrap();
+        }
+        (resolver, state)
+    }
+
+    fn next_uris(state: &ConnectState) -> Vec<String> {
+        state
+            .player()
+            .next_tracks
+            .iter()
+            .map(|t| t.uri.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_low_queue_requests_the_next_page() {
+        let (mut resolver, state) = play_until_low(Some(NEXT_URL));
+
+        assert!(resolver.add_next_page(&state));
+
+        let (next, _, _) = resolver.find_next().expect("a queued resolve");
+        assert_eq!(next.update, ContextType::Default);
+        assert_eq!(next.action, ContextAction::Append);
+        assert_eq!(next.context_uri(), DJ_URI);
+        assert_eq!(next.resolve_url.as_deref(), Some(NEXT_URL));
+    }
+
+    #[tokio::test]
+    async fn the_next_page_reaches_next_tracks_and_names_the_one_after() {
+        let (mut resolver, mut state) = play_until_low(Some(NEXT_URL));
+        resolver.add_next_page(&state);
+
+        answer(
+            &mut resolver,
+            &mut state,
+            vec![page(10..13, Some(LATER_URL))],
+        );
+
+        assert_eq!(next_uris(&state), [2, 10, 11, 12].map(uri));
+        let appended = &state.player().next_tracks[1];
+        assert_eq!(
+            appended.metadata.get(INTRO).map(String::as_str),
+            Some("<speak>10</speak>")
+        );
+        assert_eq!(
+            appended.metadata.get("context_uri").map(String::as_str),
+            Some(DJ_URI)
+        );
+
+        while state.has_next_tracks(Some(2)) {
+            state.next_track().unwrap();
+        }
+        assert!(resolver.add_next_page(&state));
+        let (next, _, _) = resolver.find_next().expect("a queued resolve");
+        assert_eq!(next.resolve_url.as_deref(), Some(LATER_URL));
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_next_page_is_left_to_autoplay() {
+        let (mut resolver, state) = play_until_low(None);
+
+        assert!(!resolver.add_next_page(&state));
+        assert!(!resolver.has_next());
+    }
+
+    #[tokio::test]
+    async fn a_failed_next_page_is_left_to_autoplay() {
+        let (mut resolver, state) = play_until_low(Some(NEXT_URL));
+        resolver.add_next_page(&state);
+        assert!(resolver.next_is_url_page());
+
+        resolver.mark_next_unavailable();
+        resolver.remove_used_and_invalid();
+
+        assert!(!resolver.add_next_page(&state));
+        assert!(!resolver.has_next());
+    }
+
+    #[tokio::test]
+    async fn an_empty_next_page_ends_the_chain() {
+        let (mut resolver, mut state) = play_until_low(Some(NEXT_URL));
+        resolver.add_next_page(&state);
+
+        answer(&mut resolver, &mut state, vec![page(0..0, Some(LATER_URL))]);
+
+        assert_eq!(state.next_page_url(), None);
+        assert!(!resolver.add_next_page(&state));
+    }
+
+    #[tokio::test]
+    async fn an_autoplay_page_does_not_continue_the_context() {
+        let (mut resolver, mut state) = play_until_low(None);
+        resolver.add(ResolveContext::from_uri(
+            DJ_URI,
+            "",
+            ContextType::Autoplay,
+            ContextAction::Append,
+        ));
+
+        answer(
+            &mut resolver,
+            &mut state,
+            vec![page(20..23, Some(RADIO_URL))],
+        );
+        while state.has_next_tracks(Some(2)) {
+            state.next_track().unwrap();
+        }
+
+        assert_eq!(state.next_page_url(), None);
+        assert!(!resolver.add_next_page(&state));
     }
 }

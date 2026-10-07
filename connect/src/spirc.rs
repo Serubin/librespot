@@ -625,9 +625,15 @@ impl SpircTask {
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
         let next_context = match next_context {
             Err(why) => {
+                let url_page = self.context_resolver.next_is_url_page();
                 self.context_resolver.mark_next_unavailable();
                 self.context_resolver.remove_used_and_invalid();
-                error!("{why}");
+                if url_page {
+                    warn!("couldn't fetch the page, leaving the queue to autoplay: {why}");
+                    self.add_autoplay_resolving_when_required();
+                } else {
+                    error!("{why}");
+                }
                 return false;
             }
             Ok(ctx) => ctx,
@@ -643,6 +649,10 @@ impl SpircTask {
                 if let Some(remaining) = remaining {
                     self.context_resolver.add_list(remaining)
                 }
+            }
+            Err(why) if self.context_resolver.next_is_url_page() => {
+                self.context_resolver.mark_next_unavailable();
+                warn!("couldn't use the page, leaving the queue to autoplay: {why}")
             }
             Err(why) => {
                 error!("{why}")
@@ -1715,11 +1725,15 @@ impl SpircTask {
     }
 
     fn add_autoplay_resolving_when_required(&mut self) {
-        let require_load_new = !self
+        let queue_low = !self
             .connect_state
             .has_next_tracks(Some(CONTEXT_FETCH_THRESHOLD))
-            && self.session.autoplay()
             && !self.connect_state.context_uri().is_empty();
+        if queue_low && self.context_resolver.add_next_page(&self.connect_state) {
+            return;
+        }
+
+        let require_load_new = queue_low && self.session.autoplay();
 
         if !require_load_new {
             return;

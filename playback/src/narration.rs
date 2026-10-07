@@ -81,7 +81,7 @@ impl NarrationClip {
         request.audio_format = AudioFormat::MP3.into();
         request.tts_voice = self.voice.into();
         request.tts_provider = self.provider.into();
-        // The player has neither a resampler nor a mono upmix, so anything else is unplayable.
+        // The player has no resampler, so any other rate is unplayable.
         request.sample_rate_hz = SAMPLE_RATE as i32;
         request
     }

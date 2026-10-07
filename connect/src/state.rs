@@ -181,8 +181,7 @@ impl ConnectState {
                 supports_external_episodes: false,
                 supports_set_backend_metadata: false,
                 supports_hifi: MessageField::none(),
-                // that "AI" dj thingy only available to specific regions/users
-                supports_dj: false,
+                supports_dj: true,
                 supports_rooms: false,
                 // AudioQuality::HIFI is available, further investigation necessary
                 supported_audio_quality: EnumOrUnknown::new(AudioQuality::VERY_HIGH),

@@ -18,6 +18,7 @@ pub struct SymphoniaDecoder {
     probe_result: ProbeResult,
     decoder: Box<dyn Decoder>,
     sample_buffer: Option<SampleBuffer<f64>>,
+    upmix_mono: bool,
 }
 
 #[derive(Default)]
@@ -33,6 +34,21 @@ pub(crate) struct LocalFileMetadata {
 
 impl SymphoniaDecoder {
     pub fn new<R>(input: R, hint: Hint) -> DecoderResult<Self>
+    where
+        R: MediaSource + 'static,
+    {
+        Self::open(input, hint, false)
+    }
+
+    /// Like [`Self::new`], but also takes mono input and plays it on both channels.
+    pub fn new_upmixing_mono<R>(input: R, hint: Hint) -> DecoderResult<Self>
+    where
+        R: MediaSource + 'static,
+    {
+        Self::open(input, hint, true)
+    }
+
+    fn open<R>(input: R, hint: Hint, allow_mono: bool) -> DecoderResult<Self>
     where
         R: MediaSource + 'static,
     {
@@ -77,7 +93,8 @@ impl SymphoniaDecoder {
         let channels = decoder.codec_params().channels.ok_or_else(|| {
             DecoderError::SymphoniaDecoder("Could not retrieve channel configuration".into())
         })?;
-        if channels.count() != NUM_CHANNELS as usize {
+        let upmix_mono = allow_mono && channels.count() == 1;
+        if channels.count() != NUM_CHANNELS as usize && !upmix_mono {
             return Err(DecoderError::SymphoniaDecoder(format!(
                 "Unsupported number of channels: {channels}"
             )));
@@ -89,6 +106,7 @@ impl SymphoniaDecoder {
             // We set the sample buffer when decoding the first full packet,
             // whose duration is also the ideal sample buffer size.
             sample_buffer: None,
+            upmix_mono,
         })
     }
 
@@ -254,7 +272,12 @@ impl AudioDecoder for SymphoniaDecoder {
                     };
 
                     sample_buffer.copy_interleaved_ref(decoded);
-                    let samples = AudioPacket::Samples(sample_buffer.samples().to_vec());
+                    let samples = if self.upmix_mono {
+                        upmix_mono(sample_buffer.samples())
+                    } else {
+                        sample_buffer.samples().to_vec()
+                    };
+                    let samples = AudioPacket::Samples(samples);
 
                     return Ok(Some((packet_position, samples)));
                 }
@@ -268,5 +291,20 @@ impl AudioDecoder for SymphoniaDecoder {
                 Err(err) => return Err(err.into()),
             }
         }
+    }
+}
+
+/// Interleaves each mono sample onto both stereo channels.
+fn upmix_mono(samples: &[f64]) -> Vec<f64> {
+    samples.iter().flat_map(|&s| [s, s]).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upmixing_mono_plays_each_sample_on_both_channels() {
+        assert_eq!(upmix_mono(&[0.1, -0.2]), [0.1, 0.1, -0.2, -0.2]);
     }
 }

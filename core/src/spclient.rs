@@ -19,6 +19,7 @@ use crate::{
         },
         connect::PutStateRequest,
         context::Context,
+        context_page::ContextPage,
         extended_metadata::BatchedEntityRequest,
         extended_metadata::{BatchedExtensionResponse, EntityRequest, ExtensionQuery},
         extension_kind::ExtensionKind,
@@ -909,7 +910,23 @@ impl SpClient {
             .request_with_options(&Method::GET, &endpoint, None, None, &NO_METRICS_AND_SALT)
             .await?;
 
-        Self::parse_context(res)
+        Self::parse_context_or_page(res)
+    }
+
+    /// Parses a context, or a bare page as a context holding just that page.
+    fn parse_context_or_page(res: Bytes) -> Result<Context, Error> {
+        Self::parse_context(res.clone()).or_else(|why| {
+            let page = std::str::from_utf8(&res)
+                .ok()
+                .and_then(|json| protobuf_json_mapping::parse_from_str::<ContextPage>(json).ok())
+                .ok_or(why)?;
+
+            debug!("parsed a page rather than a context");
+            Ok(Context {
+                pages: vec![page],
+                ..Default::default()
+            })
+        })
     }
 
     fn parse_context(res: Bytes) -> Result<Context, Error> {
@@ -1059,5 +1076,52 @@ impl SpClient {
         }
 
         Ok(url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NEXT_URL: &str = "hm://lexicon-session-provider/context-resolve/v2/session/0?contextUri=spotify:playlist:x&previousSegmentId=s";
+
+    fn parse(json: &str) -> Context {
+        SpClient::parse_context_or_page(Bytes::from(json.to_string())).expect("parsed")
+    }
+
+    #[test]
+    fn parse_context_or_page_reads_a_context() {
+        let ctx = parse(&format!(
+            r#"{{"uri":"spotify:playlist:x","pages":[{{"tracks":[{{"uri":"spotify:track:0000000000000000000001"}}],"next_page_url":"{NEXT_URL}"}}]}}"#
+        ));
+
+        assert_eq!(ctx.uri.as_deref(), Some("spotify:playlist:x"));
+        assert_eq!(ctx.pages.len(), 1);
+        assert_eq!(ctx.pages[0].next_page_url.as_deref(), Some(NEXT_URL));
+    }
+
+    #[test]
+    fn parse_context_or_page_reads_a_lone_page() {
+        let ctx = parse(&format!(
+            r#"{{"tracks":[{{"uri":"spotify:track:0000000000000000000001","metadata":{{"narration.intro.ssml":"<speak/>"}}}}],"nextPageUrl":"{NEXT_URL}"}}"#
+        ));
+
+        assert_eq!(ctx.uri, None);
+        assert_eq!(ctx.pages.len(), 1);
+        assert_eq!(ctx.pages[0].tracks.len(), 1);
+        assert_eq!(ctx.pages[0].next_page_url.as_deref(), Some(NEXT_URL));
+        assert_eq!(
+            ctx.pages[0].tracks[0]
+                .metadata
+                .get("narration.intro.ssml")
+                .map(String::as_str),
+            Some("<speak/>")
+        );
+    }
+
+    #[test]
+    fn parse_context_or_page_rejects_anything_else() {
+        assert!(SpClient::parse_context_or_page(Bytes::from_static(br#"{"foo":1}"#)).is_err());
+        assert!(SpClient::parse_context_or_page(Bytes::new()).is_err());
     }
 }

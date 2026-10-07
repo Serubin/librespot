@@ -28,6 +28,8 @@ pub struct StateContext {
     pub restrictions: Option<Restrictions>,
     /// is used to keep track which tracks are already loaded into the next_tracks
     pub index: ContextIndex,
+    /// the `hm://` url of the context's next page
+    pub next_page_url: Option<String>,
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Hash, Eq)]
@@ -385,11 +387,17 @@ impl ConnectState {
             })
             .collect::<Vec<_>>();
 
+        // an empty page ends the chain
+        let next_page_url = page
+            .next_page_url
+            .filter(|url| url.starts_with("hm://") && !tracks.is_empty());
+
         StateContext {
             tracks: tracks.into(),
             restrictions,
             metadata,
             index: ContextIndex::new(),
+            next_page_url,
         }
     }
 
@@ -521,11 +529,27 @@ impl ConnectState {
             .as_mut()
             .ok_or(StateError::NoContext(ContextType::Default))?;
 
+        let appended = context.tracks.len();
         for t in context.tracks {
             ctx.tracks.push(t)
         }
+        ctx.next_page_url = context.next_page_url;
+
+        debug!(
+            "appended {appended} tracks to the context ({} tracks), next page: {:?}",
+            ctx.tracks.len(),
+            ctx.next_page_url
+        );
 
         Ok(())
+    }
+
+    /// The `hm://` url of the next page of the context the next tracks are filled from.
+    pub fn next_page_url(&self) -> Option<&str> {
+        match self.fill_up_context {
+            ContextType::Default => self.context.as_ref()?.next_page_url.as_deref(),
+            ContextType::Autoplay => None,
+        }
     }
 }
 

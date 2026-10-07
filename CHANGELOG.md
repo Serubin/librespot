@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [core] Try all resolved addresses for the dealer connection instead of failing after the first one.
 - [audio] Try the next CDN URL when a fetch returns a non-206 status instead of only retrying on transport errors, fixing playback failures when the first CDN URL is reachable but does not stream audio.
 - [connect] Resolve a DJ context through the `hm://` url it carries, so playing Spotify's DJ loads its tracks instead of failing with "the provided context has no tracks"
+- [connect] Fetch the `next_page_url` of a context's last page when the queue runs low, so a DJ set continues past the tracks it loaded instead of asking autoplay, which answers 404 for it
 
 ## [0.8.0] - 2025-11-10
 
